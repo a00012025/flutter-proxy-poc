@@ -1,3 +1,4 @@
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -101,15 +102,145 @@ class _ProxyDemoState extends State<ProxyDemo> {
     // Step 3: Sign the CSR with the CA's private key
     final signedCert = signCSR(csr, caKey, caCert);
 
+    final signedCertP12 =
+        generatePKCS12(keyPair.privateKey, caCert, signedCert, 'abc');
+
+    print(base64.encode(signedCertP12));
+
     // Step 4: Create a SecurityContext using the generated certificate
     final securityContext = SecurityContext();
-    securityContext.useCertificateChainBytes(signedCert);
+    securityContext.useCertificateChainBytes(signedCertP12, password: 'abc');
     securityContext.usePrivateKeyBytes(privateKeyToBytes(keyPair.privateKey));
 
     return securityContext;
   }
 
-  Uint8List signCSR(ASN1Object csr, Uint8List caPrivateKey, Uint8List caCert) {
+  Uint8List generatePKCS12(RSAPrivateKey privateKey, Uint8List caCert,
+      Uint8List signedCert, String password) {
+    final pkcs12 = ASN1Sequence();
+
+    // AuthenticatedSafe -> Contains SafeContents
+    final authenticatedSafe = ASN1Sequence();
+
+    // SafeContents -> Contains SafeBags (Private Key and Certificates)
+    final privateKeyBag = ASN1Sequence()
+      ..add(ASN1ObjectIdentifier.fromComponentString(
+          '1.2.840.113549.1.12.10.1.2')) // keyBag
+      ..add(ASN1Sequence()
+        ..add(ASN1Integer(BigInt.from(0))) // Version
+        ..add(ASN1Sequence()
+          ..add(ASN1ObjectIdentifier.fromComponentString(
+              '1.2.840.113549.1.1.1')) // rsaEncryption OID
+          ..add(ASN1Null()))
+        ..add(ASN1OctetString(privateKeyToPkcs8Bytes(privateKey))));
+
+    final certBag = ASN1Sequence()
+      ..add(ASN1ObjectIdentifier.fromComponentString(
+          '1.2.840.113549.1.12.10.1.3')) // certBag
+      ..add(ASN1Sequence()
+        ..add(ASN1ObjectIdentifier.fromComponentString(
+            '1.2.840.113549.1.9.22.1')) // x509Certificate
+        ..add(ASN1OctetString(signedCert)));
+
+    final caCertBag = ASN1Sequence()
+      ..add(ASN1ObjectIdentifier.fromComponentString(
+          '1.2.840.113549.1.12.10.1.3')) // certBag
+      ..add(ASN1Sequence()
+        ..add(ASN1ObjectIdentifier.fromComponentString(
+            '1.2.840.113549.1.9.22.1')) // x509Certificate
+        ..add(ASN1OctetString(parsePemToDer(caCert))));
+
+    // SafeContents -> Sequence containing Private Key and Certificate bags
+    final safeContents = ASN1Sequence()
+      ..add(privateKeyBag)
+      ..add(certBag)
+      ..add(caCertBag);
+
+    // AuthenticatedSafe -> Sequence containing SafeContents
+    authenticatedSafe.add(safeContents);
+
+    // MacData (HMAC for integrity check)
+    final macData = _generateMacData(authenticatedSafe.encodedBytes, password);
+
+    // PKCS#12 -> Sequence containing version, AuthenticatedSafe, and MacData
+    pkcs12.add(ASN1Integer(BigInt.from(3))); // Version
+    pkcs12.add(authenticatedSafe); // Authenticated Safe Content
+    pkcs12.add(macData); // MAC Data
+
+    return pkcs12.encodedBytes;
+  }
+
+  ASN1Sequence _generateMacData(Uint8List data, String password) {
+    final macAlgorithm = ASN1Sequence()
+      ..add(ASN1ObjectIdentifier.fromComponentString(
+          '1.2.840.113549.2.7')) // HMAC-SHA-1
+      ..add(ASN1Null());
+
+    final salt = _generateSalt();
+    final macIterationCount =
+        ASN1Integer(BigInt.from(2048)); // Standard iteration count
+    final mac = _hmacSha1(data, salt, password);
+
+    return ASN1Sequence()
+      ..add(macAlgorithm)
+      ..add(ASN1OctetString(mac))
+      ..add(ASN1OctetString(salt))
+      ..add(macIterationCount);
+  }
+
+  Uint8List _generateSalt() {
+    final random = SecureRandom('Fortuna');
+    random.seed(
+        KeyParameter(Uint8List.fromList(List<int>.generate(32, (_) => 42))));
+    return random.nextBytes(8); // 8 bytes of salt
+  }
+
+  Uint8List _hmacSha1(Uint8List data, Uint8List salt, String password) {
+    final keyDerivator = PBKDF2KeyDerivator(HMac(SHA1Digest(), 64));
+    keyDerivator.init(Pbkdf2Parameters(
+        salt, 2048, 160)); // Iteration count of 2048 and key length of 160 bits
+    final hmacKey =
+        keyDerivator.process(Uint8List.fromList(utf8.encode(password)));
+
+    final mac = HMac(SHA1Digest(), 64);
+    mac.init(KeyParameter(hmacKey));
+    return mac.process(data);
+  }
+
+  Uint8List privateKeyToPkcs8Bytes(RSAPrivateKey privateKey) {
+    final algorithmIdentifier = ASN1Sequence()
+      ..add(ASN1ObjectIdentifier.fromComponentString(
+          '1.2.840.113549.1.1.1')) // rsaEncryption OID
+      ..add(ASN1Null());
+
+    final privateKeyInfo = ASN1Sequence()
+      ..add(ASN1Integer(BigInt.from(0))) // PKCS#8 version
+      ..add(algorithmIdentifier)
+      ..add(ASN1OctetString(privateKeyToPkcs1Bytes(privateKey)));
+
+    return privateKeyInfo.encodedBytes;
+  }
+
+  Uint8List privateKeyToPkcs1Bytes(RSAPrivateKey privateKey) {
+    final sequence = ASN1Sequence()
+      ..add(ASN1Integer(BigInt.from(0))) // PKCS#1 version
+      ..add(ASN1Integer(privateKey.n!)) // Modulus
+      ..add(ASN1Integer(privateKey.exponent!)) // Public exponent
+      ..add(ASN1Integer(privateKey.privateExponent!)) // Private exponent
+      ..add(ASN1Integer(privateKey.p!)) // Prime 1
+      ..add(ASN1Integer(privateKey.q!)) // Prime 2
+      ..add(ASN1Integer(privateKey.privateExponent! %
+          (privateKey.p! - BigInt.one))) // Exponent 1
+      ..add(ASN1Integer(privateKey.privateExponent! %
+          (privateKey.q! - BigInt.one))) // Exponent 2
+      ..add(
+          ASN1Integer(privateKey.q!.modInverse(privateKey.p!))); // Coefficient
+
+    return sequence.encodedBytes;
+  }
+
+  Uint8List signCSR(
+      ASN1Sequence csr, Uint8List caPrivateKey, Uint8List caCert) {
     final signer = Signer('SHA-256/RSA');
     signer.init(
         true, PrivateKeyParameter<RSAPrivateKey>(loadPrivateKey(caPrivateKey)));
@@ -118,55 +249,97 @@ class _ProxyDemoState extends State<ProxyDemo> {
     final signature =
         signer.generateSignature(csr.encodedBytes) as RSASignature;
 
-    // Create a new ASN.1 sequence to hold the signed certificate
-    final signedCert = ASN1Sequence();
+    // Create the X.509 certificate structure
+    final certificate = ASN1Sequence();
 
-    // Add the original CSR
-    signedCert.add(csr);
+    // Add version
+    certificate.add(ASN1Integer(
+        BigInt.from(2))); // Version 3 (note: ASN1Integer(2) means v3)
 
-    // Add the signature algorithm identifier
+    // Add a unique serial number
+    final serialNumber = BigInt.from(DateTime.now().millisecondsSinceEpoch);
+    certificate.add(ASN1Integer(serialNumber));
+
+    // Add signature algorithm
     final sigAlgId = ASN1Sequence();
     sigAlgId.add(ASN1ObjectIdentifier.fromComponentString(
         '1.2.840.113549.1.1.11')); // sha256WithRSAEncryption OID
     sigAlgId.add(ASN1Null());
-    signedCert.add(sigAlgId);
+    certificate.add(sigAlgId);
 
-    // Add the signature
-    final signatureBitString =
-        ASN1BitString(Uint8List.fromList(signature.bytes));
-    signedCert.add(signatureBitString);
+    // Add issuer (using CA certificate)
+    final derCaCert = parsePemToDer(caCert);
+    final parser = ASN1Parser(derCaCert);
+    final x509Sequence = parser.nextObject() as ASN1Sequence;
+    final tbsCertificate = x509Sequence.elements[0] as ASN1Sequence;
+    final caIssuer =
+        tbsCertificate.elements[3] as ASN1Sequence; // Extract issuer's DN
+    // Add the issuer DN to the certificate sequence
+    final issuer = ASN1Sequence();
+    for (var element in caIssuer.elements) {
+      issuer.add(element);
+    }
+    certificate.add(issuer);
 
-    return signedCert.encodedBytes;
+    // Add validity period
+    final validity = ASN1Sequence();
+    validity.add(ASN1UtcTime(DateTime.now()));
+    validity.add(ASN1UtcTime(
+        DateTime.now().add(Duration(days: 365)))); // 1-year validity
+    certificate.add(validity);
+
+    // Add subject (from CSR)
+    final mainSequence = csr.elements[0] as ASN1Sequence;
+    // Extract the subject DN from the main sequence
+    final subjectSeq = mainSequence.elements[1] as ASN1Sequence;
+    // Add the subject DN to the certificate sequence
+    certificate.add(subjectSeq);
+
+    // Add the public key info (from CSR)
+    final pubKeyInfoSeq = mainSequence.elements[2] as ASN1Sequence;
+    certificate.add(pubKeyInfoSeq);
+
+    // Add signature algorithm (again for certificate)
+    certificate.add(sigAlgId);
+
+    // Add the actual signature
+    certificate.add(ASN1BitString(Uint8List.fromList(signature.bytes)));
+
+    return certificate.encodedBytes;
   }
 
+  Uint8List parsePemToDer(Uint8List pem) {
+    String pemString = String.fromCharCodes(pem);
+    pemString = pemString.replaceAll('-----BEGIN CERTIFICATE-----', '');
+    pemString = pemString.replaceAll('-----END CERTIFICATE-----', '');
+    pemString = pemString.replaceAll('\n', '');
+
+    return base64.decode(pemString);
+  }
+
+  // Helper method to convert RSAPrivateKey to PKCS#8 bytes
   Uint8List privateKeyToBytes(RSAPrivateKey privateKey) {
-    var version =
-        ASN1Integer(BigInt.from(0)); // PKCS#8 version (0 for private keys)
-    var privateKeyAlgorithm = ASN1Sequence()
-      ..add(ASN1ObjectIdentifier.fromComponentString(
-          '1.2.840.113549.1.1.1')) // rsaEncryption OID
-      ..add(ASN1Null());
+    final privateKeySequence = ASN1Sequence()
+      ..add(ASN1Integer(BigInt.from(0))) // Version
+      ..add(ASN1Integer(privateKey.n!)) // Modulus
+      ..add(ASN1Integer(privateKey.exponent!)) // Public exponent
+      ..add(ASN1Integer(privateKey.privateExponent!)) // Private exponent
+      ..add(ASN1Integer(privateKey.p!)) // Prime 1
+      ..add(ASN1Integer(privateKey.q!)) // Prime 2
+      ..add(ASN1Integer(privateKey.privateExponent! %
+          (privateKey.p! - BigInt.one))) // Exponent 1
+      ..add(ASN1Integer(privateKey.privateExponent! %
+          (privateKey.q! - BigInt.one))) // Exponent 2
+      ..add(
+          ASN1Integer(privateKey.q!.modInverse(privateKey.p!))); // Coefficient
 
-    var privateKeySequence = ASN1Sequence()
-      ..add(ASN1Integer(BigInt.from(0))) // PKCS#1 version (0 for private keys)
-      ..add(ASN1Integer(privateKey.n!))
-      ..add(ASN1Integer(privateKey.exponent!))
-      ..add(ASN1Integer(privateKey.privateExponent!))
-      ..add(ASN1Integer(privateKey.p!))
-      ..add(ASN1Integer(privateKey.q!))
-      ..add(ASN1Integer(
-          privateKey.privateExponent! % (privateKey.p! - BigInt.one)))
-      ..add(ASN1Integer(
-          privateKey.privateExponent! % (privateKey.q! - BigInt.one)))
-      ..add(ASN1Integer(privateKey.q!.modInverse(privateKey.p!)));
-
-    var privateKeyOctetString =
-        ASN1OctetString(privateKeySequence.encodedBytes);
-
-    var sequence = ASN1Sequence()
-      ..add(version)
-      ..add(privateKeyAlgorithm)
-      ..add(privateKeyOctetString);
+    final sequence = ASN1Sequence()
+      ..add(ASN1Integer(BigInt.from(0)))
+      ..add(ASN1Sequence()
+        ..add(ASN1ObjectIdentifier.fromComponentString(
+            '1.2.840.113549.1.1.1')) // rsaEncryption OID
+        ..add(ASN1Null()))
+      ..add(ASN1OctetString(privateKeySequence.encodedBytes));
 
     return sequence.encodedBytes;
   }
@@ -183,7 +356,7 @@ class _ProxyDemoState extends State<ProxyDemo> {
         pair.publicKey as RSAPublicKey, pair.privateKey as RSAPrivateKey);
   }
 
-  ASN1Object generateCSR(
+  ASN1Sequence generateCSR(
       RSAPrivateKey privateKey, RSAPublicKey publicKey, String commonName) {
     // Step 1: Create the main ASN.1 sequence
     final asn1 = ASN1Sequence();
