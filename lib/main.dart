@@ -25,8 +25,19 @@ class ProxyDemo extends StatefulWidget {
   _ProxyDemoState createState() => _ProxyDemoState();
 }
 
+const supportedProtocols = [
+  'http/1.1',
+  'h2',
+  'http/1.0',
+  'tlsv1.2',
+  'tlsv1.3',
+  'tlsv1.1',
+  'tlsv1'
+];
+
 class _ProxyDemoState extends State<ProxyDemo> {
   HttpServer? _server;
+  SecurityContext? securityContext;
 
   @override
   void initState() {
@@ -41,40 +52,48 @@ class _ProxyDemoState extends State<ProxyDemo> {
   }
 
   Future<void> startTcpProxy() async {
+    // Upgrade the socket to a SecureSocket (Server-side TLS)
+    final p12Data = await rootBundle.load('assets/harry-proxy.p12');
+    final p12Bytes = p12Data.buffer.asUint8List();
+    securityContext = SecurityContext()
+      ..useCertificateChainBytes(p12Bytes, password: 'abc')
+      ..usePrivateKeyBytes(p12Bytes, password: 'abc')
+      ..setAlpnProtocols(supportedProtocols, true);
+
+    // Add trusted certificates
+    // final trustedCertData = await rootBundle.load('assets/harry-local.pem');
+    // final trustedCertBytes = trustedCertData.buffer.asUint8List();
+    // securityContext!.setTrustedCertificatesBytes(trustedCertBytes);
+
     final server = await ServerSocket.bind(InternetAddress.anyIPv4, 8080);
     print('TCP Proxy Server is running on port 8080');
 
     await for (Socket clientSocket in server) {
-      clientSocket.listen((Uint8List data) async {
-        String request = String.fromCharCodes(data);
-        if (request.startsWith('CONNECT')) {
-          // Parse the target host and port from the CONNECT request
-          final targetInfo = request.split(' ')[1];
-          final targetHost = targetInfo.split(':')[0];
-          final targetPort = int.parse(targetInfo.split(':')[1]);
-
-          // Respond with "200 Connection Established"
-          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-
-          // Upgrade the socket to a SecureSocket (Server-side TLS)
-          final p12Data = await rootBundle.load('assets/harry-proxy.p12');
-          final p12Bytes = p12Data.buffer.asUint8List();
-          SecurityContext context = SecurityContext()
-            ..useCertificateChainBytes(p12Bytes, password: 'abc')
-            ..usePrivateKeyBytes(p12Bytes, password: 'abc')
-            ..setAlpnProtocols(['http/1.1'], true);
-
-          SecureSocket secureClientSocket = await SecureSocket.secureServer(
-            clientSocket,
-            context,
-            supportedProtocols: ['http/1.1'],
-          );
-
-          // Handle the CONNECT method by establishing a connection to the target server
-          await _handleTlsMitm(secureClientSocket, targetHost, targetPort);
-        }
-      });
+      _handleConnection(clientSocket);
     }
+  }
+
+  Future<void> _handleConnection(Socket clientSocket) async {
+    clientSocket.listen((Uint8List data) async {
+      String request = String.fromCharCodes(data);
+      if (request.startsWith('CONNECT')) {
+        // Parse the target host and port from the CONNECT request
+        final targetInfo = request.split(' ')[1];
+        final targetHost = targetInfo.split(':')[0];
+        final targetPort = int.parse(targetInfo.split(':')[1]);
+
+        // Respond with "200 Connection Established"
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+
+        // Start the TLS handshake and handle the connection in a new future
+        SecureSocket secureClientSocket = await SecureSocket.secureServer(
+            clientSocket, securityContext,
+            supportedProtocols: supportedProtocols);
+
+        // Handle the CONNECT method by establishing a connection to the target server
+        await _handleTlsMitm(secureClientSocket, targetHost, targetPort);
+      }
+    });
   }
 
   Future<void> _handleTlsMitm(
@@ -91,6 +110,7 @@ class _ProxyDemoState extends State<ProxyDemo> {
       // Forward data from the client to the target server
       clientSocket.listen(
         (data) {
+          print('Received data from client: ${String.fromCharCodes(data)}');
           targetSocket.add(data);
         },
         onError: (error) {
@@ -107,6 +127,7 @@ class _ProxyDemoState extends State<ProxyDemo> {
       // Forward data from the target server to the client
       targetSocket.listen(
         (data) {
+          print('Received data from target: ${String.fromCharCodes(data)}');
           clientSocket.add(data);
         },
         onError: (error) {
