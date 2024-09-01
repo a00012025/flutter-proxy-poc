@@ -10,6 +10,8 @@ dependencies:
   cupertino_icons: ^1.0.2
   http: ^1.2.2
   path_provider: ^2.1.4
+  pointycastle: ^3.9.1
+  asn1lib: ^1.5.3
 
 dev_dependencies:
   flutter_test:
@@ -20,3 +22,5 @@ flutter:
   uses-material-design: true
   assets:
     - assets/harry-local.p12
+    - assets/ca-cert.pem
+    - assets/ca-key.pem
