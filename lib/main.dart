@@ -77,7 +77,7 @@ class _ProxyDemoState extends State<ProxyDemo> {
 
         // Dynamically generate server certificate for the target domain
         final securityContext =
-            await generateSecurityContext(targetHost, caCert, caKey);
+            await generateSecurityContext(targetHost, caKey, caCert);
 
         // Start the TLS handshake and handle the connection in a new future
         SecureSocket secureClientSocket = await SecureSocket.secureServer(
@@ -91,7 +91,7 @@ class _ProxyDemoState extends State<ProxyDemo> {
   }
 
   Future<SecurityContext> generateSecurityContext(
-      String domain, Uint8List caCert, Uint8List caKey) async {
+      String domain, Uint8List caKey, Uint8List caCert) async {
     // Step 1: Generate RSA Key Pair
     final keyPair = generateKeyPair();
 
@@ -109,30 +109,64 @@ class _ProxyDemoState extends State<ProxyDemo> {
     return securityContext;
   }
 
+  Uint8List signCSR(ASN1Object csr, Uint8List caPrivateKey, Uint8List caCert) {
+    final signer = Signer('SHA-256/RSA');
+    signer.init(
+        true, PrivateKeyParameter<RSAPrivateKey>(loadPrivateKey(caPrivateKey)));
+
+    // Generate the signature for the CSR
+    final signature =
+        signer.generateSignature(csr.encodedBytes) as RSASignature;
+
+    // Create a new ASN.1 sequence to hold the signed certificate
+    final signedCert = ASN1Sequence();
+
+    // Add the original CSR
+    signedCert.add(csr);
+
+    // Add the signature algorithm identifier
+    final sigAlgId = ASN1Sequence();
+    sigAlgId.add(ASN1ObjectIdentifier.fromComponentString(
+        '1.2.840.113549.1.1.11')); // sha256WithRSAEncryption OID
+    sigAlgId.add(ASN1Null());
+    signedCert.add(sigAlgId);
+
+    // Add the signature
+    final signatureBitString =
+        ASN1BitString(Uint8List.fromList(signature.bytes));
+    signedCert.add(signatureBitString);
+
+    return signedCert.encodedBytes;
+  }
+
   Uint8List privateKeyToBytes(RSAPrivateKey privateKey) {
     var version =
-        ASN1Integer(BigInt.from(0)); // PKCS#1 version (0 for private keys)
-    var modulus = ASN1Integer(privateKey.n!);
-    var publicExponent = ASN1Integer(privateKey.exponent!);
-    var privateExponent = ASN1Integer(privateKey.privateExponent!);
-    var prime1 = ASN1Integer(privateKey.p!);
-    var prime2 = ASN1Integer(privateKey.q!);
-    var exponent1 =
-        ASN1Integer(privateKey.privateExponent! % (privateKey.p! - BigInt.one));
-    var exponent2 =
-        ASN1Integer(privateKey.privateExponent! % (privateKey.q! - BigInt.one));
-    var coefficient = ASN1Integer(privateKey.q!.modInverse(privateKey.p!));
+        ASN1Integer(BigInt.from(0)); // PKCS#8 version (0 for private keys)
+    var privateKeyAlgorithm = ASN1Sequence()
+      ..add(ASN1ObjectIdentifier.fromComponentString(
+          '1.2.840.113549.1.1.1')) // rsaEncryption OID
+      ..add(ASN1Null());
+
+    var privateKeySequence = ASN1Sequence()
+      ..add(ASN1Integer(BigInt.from(0))) // PKCS#1 version (0 for private keys)
+      ..add(ASN1Integer(privateKey.n!))
+      ..add(ASN1Integer(privateKey.exponent!))
+      ..add(ASN1Integer(privateKey.privateExponent!))
+      ..add(ASN1Integer(privateKey.p!))
+      ..add(ASN1Integer(privateKey.q!))
+      ..add(ASN1Integer(
+          privateKey.privateExponent! % (privateKey.p! - BigInt.one)))
+      ..add(ASN1Integer(
+          privateKey.privateExponent! % (privateKey.q! - BigInt.one)))
+      ..add(ASN1Integer(privateKey.q!.modInverse(privateKey.p!)));
+
+    var privateKeyOctetString =
+        ASN1OctetString(privateKeySequence.encodedBytes);
 
     var sequence = ASN1Sequence()
       ..add(version)
-      ..add(modulus)
-      ..add(publicExponent)
-      ..add(privateExponent)
-      ..add(prime1)
-      ..add(prime2)
-      ..add(exponent1)
-      ..add(exponent2)
-      ..add(coefficient);
+      ..add(privateKeyAlgorithm)
+      ..add(privateKeyOctetString);
 
     return sequence.encodedBytes;
   }
@@ -151,11 +185,14 @@ class _ProxyDemoState extends State<ProxyDemo> {
 
   ASN1Object generateCSR(
       RSAPrivateKey privateKey, RSAPublicKey publicKey, String commonName) {
+    // Step 1: Create the main ASN.1 sequence
     final asn1 = ASN1Sequence();
 
+    // Step 2: Add the version
     final version = ASN1Integer(BigInt.from(0)); // Version 1
     asn1.add(version);
 
+    // Step 3: Add the subject information (Common Name)
     final subject = ASN1Sequence();
     subject.add(ASN1Set()
       ..add(ASN1Sequence()
@@ -163,26 +200,36 @@ class _ProxyDemoState extends State<ProxyDemo> {
         ..add(ASN1UTF8String(commonName))));
     asn1.add(subject);
 
+    // Step 4: Add the public key information
     final publicKeyInfo = ASN1Sequence();
     publicKeyInfo.add(ASN1Sequence()
       ..add(ASN1ObjectIdentifier.fromComponentString('1.2.840.113549.1.1.1'))
       ..add(ASN1Null()));
-    publicKeyInfo.add(
-        ASN1BitString(Uint8List.fromList(bigIntToBytes(publicKey.modulus!))));
+    publicKeyInfo.add(ASN1BitString(Uint8List.fromList(
+        bigIntToBytes(publicKey.modulus!) +
+            bigIntToBytes(publicKey.exponent!))));
     asn1.add(publicKeyInfo);
 
-    // Sign the CSR
+    // Step 5: Sign the CSR structure (without the signature part)
     final signer = Signer('SHA-256/RSA');
     signer.init(true, PrivateKeyParameter<RSAPrivateKey>(privateKey));
     final signature = signer.generateSignature(asn1.encodedBytes);
 
-    asn1.add(ASN1Sequence()
-      ..add(ASN1ObjectIdentifier.fromComponentString('1.2.840.113549.1.1.1'))
-      ..add(ASN1Null()));
-    asn1.add(
-        ASN1BitString(Uint8List.fromList((signature as RSASignature).bytes)));
+    // Step 6: Create the signature algorithm identifier
+    final sigAlgId = ASN1Sequence();
+    sigAlgId.add(ASN1ObjectIdentifier.fromComponentString(
+        '1.2.840.113549.1.1.11')); // sha256WithRSAEncryption OID
+    sigAlgId.add(ASN1Null());
 
-    return asn1;
+    // Step 7: Add the signature algorithm identifier and the signature
+    final finalSequence = ASN1Sequence()
+      ..add(asn1)
+      ..add(sigAlgId)
+      ..add(
+          ASN1BitString(Uint8List.fromList((signature as RSASignature).bytes)));
+
+    // Return the fully encoded CSR with signature
+    return finalSequence;
   }
 
   Uint8List bigIntToBytes(BigInt number) {
@@ -204,17 +251,9 @@ class _ProxyDemoState extends State<ProxyDemo> {
     return result;
   }
 
-  Uint8List signCSR(ASN1Object csr, Uint8List caPrivateKey, Uint8List caCert) {
-    // Implement the signing logic here (simplified)
-    final signer = Signer('SHA-256/RSA');
-    signer.init(
-        true, PrivateKeyParameter<RSAPrivateKey>(loadPrivateKey(caPrivateKey)));
-    return (signer.generateSignature(csr.encodedBytes) as RSASignature).bytes;
-  }
-
   RSAPrivateKey loadPrivateKey(Uint8List keyData) {
     // Step 1: Decode the PEM format if needed
-    String pem = utf8.decode(keyData);
+    String pem = String.fromCharCodes(keyData);
     pem = pem.replaceAll('-----BEGIN PRIVATE KEY-----', '');
     pem = pem.replaceAll('-----END PRIVATE KEY-----', '');
     pem = pem.replaceAll('\n', '');
@@ -224,46 +263,26 @@ class _ProxyDemoState extends State<ProxyDemo> {
     ASN1Parser asn1Parser = ASN1Parser(derData);
     ASN1Sequence topLevelSeq = asn1Parser.nextObject() as ASN1Sequence;
 
-    // Step 3: Check the structure and navigate correctly
-    int currentIndex = 0;
+    // Step 3: Navigate to the octet string that contains the key data
+    ASN1OctetString keyOctetString = topLevelSeq.elements[2] as ASN1OctetString;
 
-    if (topLevelSeq.elements[currentIndex] is ASN1Integer) {
-      // PKCS#1 format starts with an Integer (version)
-      currentIndex++; // Skip the version
-    } else if (topLevelSeq.elements[currentIndex] is ASN1Sequence) {
-      // PKCS#8 format starts with a sequence
-      ASN1Sequence algorithmSeq =
-          topLevelSeq.elements[currentIndex++] as ASN1Sequence;
-      ASN1ObjectIdentifier oid =
-          algorithmSeq.elements[0] as ASN1ObjectIdentifier;
-      print("Algorithm OID: ${oid.identifier}");
-      // The actual key data is in the next element, which is a bit string
-      ASN1BitString bitString =
-          topLevelSeq.elements[currentIndex++] as ASN1BitString;
-      asn1Parser = ASN1Parser(bitString.encodedBytes);
-      topLevelSeq = asn1Parser.nextObject() as ASN1Sequence;
-      currentIndex = 0;
-    }
+    // Step 4: Parse the octet string to access the key components
+    ASN1Parser keyParser = ASN1Parser(keyOctetString.octets);
+    ASN1Sequence keySeq = keyParser.nextObject() as ASN1Sequence;
 
-    // Now we should be in the correct sequence for key components
-    BigInt modulus =
-        (topLevelSeq.elements[currentIndex++] as ASN1Integer).valueAsBigInteger;
+    // Extract key components
+    BigInt modulus = (keySeq.elements[1] as ASN1Integer).valueAsBigInteger;
     BigInt publicExponent =
-        (topLevelSeq.elements[currentIndex++] as ASN1Integer).valueAsBigInteger;
+        (keySeq.elements[2] as ASN1Integer).valueAsBigInteger;
     BigInt privateExponent =
-        (topLevelSeq.elements[currentIndex++] as ASN1Integer).valueAsBigInteger;
-    BigInt p =
-        (topLevelSeq.elements[currentIndex++] as ASN1Integer).valueAsBigInteger;
-    BigInt q =
-        (topLevelSeq.elements[currentIndex++] as ASN1Integer).valueAsBigInteger;
-    BigInt exp1 =
-        (topLevelSeq.elements[currentIndex++] as ASN1Integer).valueAsBigInteger;
-    BigInt exp2 =
-        (topLevelSeq.elements[currentIndex++] as ASN1Integer).valueAsBigInteger;
-    BigInt coeff =
-        (topLevelSeq.elements[currentIndex++] as ASN1Integer).valueAsBigInteger;
+        (keySeq.elements[3] as ASN1Integer).valueAsBigInteger;
+    BigInt p = (keySeq.elements[4] as ASN1Integer).valueAsBigInteger;
+    BigInt q = (keySeq.elements[5] as ASN1Integer).valueAsBigInteger;
+    BigInt exp1 = (keySeq.elements[6] as ASN1Integer).valueAsBigInteger;
+    BigInt exp2 = (keySeq.elements[7] as ASN1Integer).valueAsBigInteger;
+    BigInt coeff = (keySeq.elements[8] as ASN1Integer).valueAsBigInteger;
 
-    // Step 4: Create and return the RSAPrivateKey object
+    // Step 5: Create and return the RSAPrivateKey object
     return RSAPrivateKey(modulus, privateExponent, p, q);
   }
 
