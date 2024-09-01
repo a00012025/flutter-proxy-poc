@@ -25,15 +25,7 @@ class ProxyDemo extends StatefulWidget {
   _ProxyDemoState createState() => _ProxyDemoState();
 }
 
-const supportedProtocols = [
-  'http/1.1',
-  'h2',
-  'http/1.0',
-  'tlsv1.2',
-  'tlsv1.3',
-  'tlsv1.1',
-  'tlsv1'
-];
+const supportedProtocols = ['http/1.1', 'h2'];
 
 class _ProxyDemoState extends State<ProxyDemo> {
   HttpServer? _server;
@@ -53,17 +45,12 @@ class _ProxyDemoState extends State<ProxyDemo> {
 
   Future<void> startTcpProxy() async {
     // Upgrade the socket to a SecureSocket (Server-side TLS)
-    final p12Data = await rootBundle.load('assets/harry-proxy.p12');
+    final p12Data = await rootBundle.load('assets/harry-local.p12');
     final p12Bytes = p12Data.buffer.asUint8List();
     securityContext = SecurityContext()
       ..useCertificateChainBytes(p12Bytes, password: 'abc')
       ..usePrivateKeyBytes(p12Bytes, password: 'abc')
       ..setAlpnProtocols(supportedProtocols, true);
-
-    // Add trusted certificates
-    // final trustedCertData = await rootBundle.load('assets/harry-local.pem');
-    // final trustedCertBytes = trustedCertData.buffer.asUint8List();
-    // securityContext!.setTrustedCertificatesBytes(trustedCertBytes);
 
     final server = await ServerSocket.bind(InternetAddress.anyIPv4, 8080);
     print('TCP Proxy Server is running on port 8080');
@@ -104,7 +91,7 @@ class _ProxyDemoState extends State<ProxyDemo> {
         targetHost,
         targetPort,
         context: SecurityContext.defaultContext,
-        supportedProtocols: ['http/1.1'],
+        supportedProtocols: supportedProtocols,
       );
 
       // Forward data from the client to the target server
