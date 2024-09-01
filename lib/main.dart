@@ -117,54 +117,56 @@ class _ProxyDemoState extends State<ProxyDemo> {
 
   Uint8List generatePKCS12(RSAPrivateKey privateKey, Uint8List caCert,
       Uint8List signedCert, String password) {
-    final pkcs12 = ASN1Sequence();
-
-    // AuthenticatedSafe -> Contains SafeContents
-    final authenticatedSafe = ASN1Sequence();
-
-    // SafeContents -> Contains SafeBags (Private Key and Certificates)
+    // SafeContents -> Private Key Bag
     final privateKeyBag = ASN1Sequence()
       ..add(ASN1ObjectIdentifier.fromComponentString(
-          '1.2.840.113549.1.12.10.1.2')) // keyBag
+          '1.2.840.113549.1.12.10.1.2')) // keyBag OID
       ..add(ASN1Sequence()
-        ..add(ASN1Integer(BigInt.from(0))) // Version
+        ..add(ASN1Integer(BigInt.from(0))) // version
         ..add(ASN1Sequence()
           ..add(ASN1ObjectIdentifier.fromComponentString(
               '1.2.840.113549.1.1.1')) // rsaEncryption OID
           ..add(ASN1Null()))
         ..add(ASN1OctetString(privateKeyToPkcs8Bytes(privateKey))));
 
+    // SafeContents -> Certificate Bag
     final certBag = ASN1Sequence()
       ..add(ASN1ObjectIdentifier.fromComponentString(
-          '1.2.840.113549.1.12.10.1.3')) // certBag
+          '1.2.840.113549.1.12.10.1.3')) // certBag OID
       ..add(ASN1Sequence()
         ..add(ASN1ObjectIdentifier.fromComponentString(
-            '1.2.840.113549.1.9.22.1')) // x509Certificate
+            '1.2.840.113549.1.9.22.1')) // x509Certificate OID
         ..add(ASN1OctetString(signedCert)));
 
     final caCertBag = ASN1Sequence()
       ..add(ASN1ObjectIdentifier.fromComponentString(
-          '1.2.840.113549.1.12.10.1.3')) // certBag
+          '1.2.840.113549.1.12.10.1.3')) // certBag OID
       ..add(ASN1Sequence()
         ..add(ASN1ObjectIdentifier.fromComponentString(
-            '1.2.840.113549.1.9.22.1')) // x509Certificate
+            '1.2.840.113549.1.9.22.1')) // x509Certificate OID
         ..add(ASN1OctetString(parsePemToDer(caCert))));
 
-    // SafeContents -> Sequence containing Private Key and Certificate bags
+    // Wrap Private Key and Certificates into SafeContents
     final safeContents = ASN1Sequence()
       ..add(privateKeyBag)
       ..add(certBag)
       ..add(caCertBag);
 
-    // AuthenticatedSafe -> Sequence containing SafeContents
-    authenticatedSafe.add(safeContents);
+    final authenticatedSafe = ASN1Sequence();
+    authenticatedSafe.add(ASN1OctetString(safeContents.encodedBytes));
+
+    final authSafe = ASN1Sequence();
+    authSafe.add(ASN1ObjectIdentifier.fromComponentString(
+        '1.2.840.113549.1.7.1')); // data OID
+    authSafe.add(ASN1OctetString(authenticatedSafe.encodedBytes));
 
     // MacData (HMAC for integrity check)
     final macData = _generateMacData(authenticatedSafe.encodedBytes, password);
 
     // PKCS#12 -> Sequence containing version, AuthenticatedSafe, and MacData
+    final pkcs12 = ASN1Sequence();
     pkcs12.add(ASN1Integer(BigInt.from(3))); // Version
-    pkcs12.add(authenticatedSafe); // Authenticated Safe Content
+    pkcs12.add(authSafe); // Authenticated Safe Content
     pkcs12.add(macData); // MAC Data
 
     return pkcs12.encodedBytes;
